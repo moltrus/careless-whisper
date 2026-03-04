@@ -1,5 +1,5 @@
 /**
- * Device Activity Tracker - CLI Interface
+ * Careless Whisper - CLI Interface
  *
  * This is a proof-of-concept tool demonstrating privacy vulnerabilities
  * in messaging apps (in this case WhatsApp) through RTT-based activity analysis.
