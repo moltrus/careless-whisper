@@ -1,5 +1,5 @@
 /**
- * Device Activity Tracker - Web Server (WhatsApp Only)
+ * Careless Whisper - Web Server (WhatsApp Only)
  *
  * HTTP server with Socket.IO for real-time tracking visualization.
  * Provides REST API and WebSocket interface for the React frontend.
@@ -31,6 +31,9 @@ let sock: any;
 let isWhatsAppConnected = false;
 let globalProbeMethod: ProbeMethod = 'delete'; // Default to delete method
 let currentWhatsAppQr: string | null = null; // Store current QR code for new clients
+let reconnectAttempt = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const INITIAL_BACKOFF = 2000; // 2 seconds
 
 interface TrackerEntry {
     tracker: WhatsAppTracker;
@@ -40,20 +43,26 @@ interface TrackerEntry {
 const trackers: Map<string, TrackerEntry> = new Map(); // JID -> Tracker entry
 
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
-    sock = makeWASocket({
-        auth: state,
-        logger: pino({ level: 'debug' }),
-        markOnlineOnConnect: true,
-        printQRInTerminal: false,
-    });
+        sock = makeWASocket({
+            auth: state,
+            version: [2, 3000, 1033893291],
+            logger: pino({ level: 'error' }),
+            printQRInTerminal: false,
+            browser: ["Ubuntu", "Chrome", "20.0.04"],
+            syncFullHistory: false,
+            retryRequestDelayMs: 200,
+            generateHighQualityLinkPreview: false,
+        });
 
-    sock.ev.on('connection.update', async (update: any) => {
-        const { connection, lastDisconnect, qr } = update;
+        sock.ev.on('connection.update', async (update: any) => {
+            const { connection, lastDisconnect, qr } = update;
 
-        if (qr) {
+            if (qr) {
             console.log('QR Code generated');
+            reconnectAttempt = 0; // Reset on successful QR generation
             currentWhatsAppQr = qr; // Store the QR code
             io.emit('qr', qr);
         }
@@ -62,19 +71,31 @@ async function connectToWhatsApp() {
             isWhatsAppConnected = false;
             currentWhatsAppQr = null; // Clear QR on close
             const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('connection closed, reconnecting ', shouldReconnect);
-            if (shouldReconnect) {
-                connectToWhatsApp();
+            const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+            console.log(`Connection closed [Status: ${statusCode}]. Reconnecting: ${shouldReconnect}`);
+            
+            if (shouldReconnect && reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
+                const backoffTime = INITIAL_BACKOFF * Math.pow(2, reconnectAttempt);
+                reconnectAttempt++;
+                console.log(`Attempting reconnect (${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS}) in ${backoffTime}ms...`);
+                setTimeout(() => connectToWhatsApp(), backoffTime);
+            } else if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+                console.error('Max reconnection attempts reached. Please restart the server.');
             }
         } else if (connection === 'open') {
             isWhatsAppConnected = true;
+            reconnectAttempt = 0; // Reset on successful connection
             currentWhatsAppQr = null; // Clear QR on successful connection
-            console.log('opened connection');
+            console.log('Connected to WhatsApp');
             io.emit('connection-open');
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.error', (error: any) => {
+        console.error('Connection error:', error?.message || error);
+    });
 
     sock.ev.on('messaging-history.set', ({ chats, contacts, messages, isLatest }: any) => {
         console.log(`[SESSION] History sync - Chats: ${chats.length}, Contacts: ${contacts.length}, Messages: ${messages.length}, Latest: ${isLatest}`);
@@ -82,9 +103,18 @@ async function connectToWhatsApp() {
 
     sock.ev.on('messages.update', (updates: any) => {
         for (const update of updates) {
-            console.log(`[MSG UPDATE] JID: ${update.key.remoteJid}, ID: ${update.key.id}, Status: ${update.update.status}, FromMe: ${update.key.fromMe}`);
+                console.log(`[MSG UPDATE] JID: ${update.key.remoteJid}, ID: ${update.key.id}, Status: ${update.update.status}, FromMe: ${update.key.fromMe}`);
+            }
+        });
+    } catch (error) {
+        console.error('Fatal error during WhatsApp connection setup:', error);
+        const backoffTime = INITIAL_BACKOFF * Math.pow(2, reconnectAttempt);
+        reconnectAttempt++;
+        if (reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
+            console.log(`Retrying in ${backoffTime}ms...`);
+            setTimeout(() => connectToWhatsApp(), backoffTime);
         }
-    });
+    }
 }
 
 connectToWhatsApp();
